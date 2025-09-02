@@ -1,4 +1,7 @@
 # RAFT
+
+<img src="./merged.gif" width="400">
+
 This repository contains the source code for our paper:
 
 [RAFT: Recurrent All Pairs Field Transforms for Optical Flow](https://arxiv.org/pdf/2003.12039.pdf)<br/>
