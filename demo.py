@@ -7,21 +7,117 @@ import cv2
 import glob
 import numpy as np
 import torch
+import time
 from PIL import Image
 
 from raft import RAFT
 from utils import flow_viz
 from utils.utils import InputPadder
-
+import torchvision.transforms as T
+import torchvision.models as models
 
 
 DEVICE = 'cuda'
+# DEVICE = 'cpu'
+# DEVICE = 'mps'
 
+# 统一resize到小尺寸，减少计算开销
 def load_image(imfile):
     img = np.array(Image.open(imfile)).astype(np.uint8)
+    h, w = img.shape[:2]
+    if w >= h:
+        new_wh = (768, 432)
+    else:
+        new_wh = (432, 768)
+    img = cv2.resize(img, new_wh, interpolation=cv2.INTER_AREA)
     img = torch.from_numpy(img).permute(2, 0, 1).float()
     return img[None].to(DEVICE)
 
+def _torch_img_to_cv_uint8_rgb(img_torch):
+    img_np = img_torch[0].permute(1, 2, 0).detach().cpu().numpy()
+    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+    return img_np
+
+def estimate_global_affine(img1_rgb_uint8, img2_rgb_uint8):
+    img1 = cv2.cvtColor(img1_rgb_uint8, cv2.COLOR_RGB2GRAY)
+    img2 = cv2.cvtColor(img2_rgb_uint8, cv2.COLOR_RGB2GRAY)
+
+    orb = cv2.ORB_create(4000)
+    kp1, des1 = orb.detectAndCompute(img1, None)
+    kp2, des2 = orb.detectAndCompute(img2, None)
+
+    if des1 is None or des2 is None or len(kp1) < 6 or len(kp2) < 6:
+        M = np.array([[1,0,0],[0,1,0]], dtype=np.float32)
+        return M
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = matcher.match(des1, des2)
+    if len(matches) < 6:
+        M = np.array([[1,0,0],[0,1,0]], dtype=np.float32)
+        return M
+
+    matches = sorted(matches, key=lambda m: m.distance)
+    keep = max(30, int(len(matches) * 0.3))
+    matches = matches[:keep]
+
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+    M, inliers = cv2.estimateAffinePartial2D(
+        pts1, pts2, method=cv2.RANSAC, ransacReprojThreshold=3.0, maxIters=5000
+    )
+    if M is None:
+        M = np.array([[1,0,0],[0,1,0]], dtype=np.float32)
+
+    return M.astype(np.float32)
+
+def affine_to_flow(M, H, W):
+    xs, ys = np.meshgrid(np.arange(W, dtype=np.float32),
+                         np.arange(H, dtype=np.float32))
+    x2 = M[0,0]*xs + M[0,1]*ys + M[0,2]
+    y2 = M[1,0]*xs + M[1,1]*ys + M[1,2]
+
+    dx = x2 - xs
+    dy = y2 - ys
+    flow_bg = np.stack([dx, dy], axis=0)  # [2, H, W]
+    return flow_bg  # numpy float32
+
+def get_camera_motion(image1, image2):
+    img1_np = _torch_img_to_cv_uint8_rgb(image1)
+    img2_np = _torch_img_to_cv_uint8_rgb(image2)
+    H, W = img1_np.shape[:2]
+
+    M = estimate_global_affine(img1_np, img2_np)
+    flow_bg_np = affine_to_flow(M, H, W).astype(np.float32)
+    flow_bg = torch.from_numpy(flow_bg_np)[None, ...].to(DEVICE)
+
+    return flow_bg
+
+def get_human_mask(image_torch, threshold=0.5):
+    if not hasattr(get_human_mask, "model"):
+        model = models.segmentation.deeplabv3_resnet50(pretrained=True).to(DEVICE)
+        model.eval()
+        get_human_mask.model = model
+        get_human_mask.transform = T.Compose([
+            T.ConvertImageDtype(torch.float32),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ])
+
+    model = get_human_mask.model
+    transform = get_human_mask.transform
+
+    x = image_torch / 255.0
+    x = transform(x)
+
+    with torch.no_grad():
+        out = model(x)['out']  # [1,21,H,W]
+        probs = torch.softmax(out, dim=1)
+        # person类id=15
+        person_mask = probs[:,15:16,:,:]  
+        mask = (person_mask > threshold).float()
+
+    return mask
 
 def viz(img, flo):
     img = img[0].permute(1,2,0).cpu().numpy()
@@ -38,10 +134,10 @@ def viz(img, flo):
     cv2.imshow('image', img_flo[:, :, [2,1,0]]/255.0)
     cv2.waitKey()
 
-
 def demo(args):
     model = torch.nn.DataParallel(RAFT(args))
-    model.load_state_dict(torch.load(args.model))
+    # model.load_state_dict(torch.load(args.model))
+    model.load_state_dict(torch.load(args.model, map_location=torch.device(DEVICE)))
 
     model = model.module
     model.to(DEVICE)
@@ -52,23 +148,43 @@ def demo(args):
                  glob.glob(os.path.join(args.path, '*.jpg'))
         
         images = sorted(images)
+        vals = []
+        vals_bg = []
         for imfile1, imfile2 in zip(images[:-1], images[1:]):
             image1 = load_image(imfile1)
             image2 = load_image(imfile2)
 
             padder = InputPadder(image1.shape)
             image1, image2 = padder.pad(image1, image2)
-
             flow_low, flow_up = model(image1, image2, iters=20, test_mode=True)
-            viz(image1, flow_up)
-
+            flow_bg = get_camera_motion(image1, image2)      
+            viz(image1, flow_subject) # 原始的光流可视化
+            flow_subject = flow_up-flow_bg
+            # viz(image1, flow_subject) # 减掉背景后的光流可视化
+            mask = get_human_mask(image1)
+            flow_subject = flow_subject * mask
+            h, w = flow_subject.shape[-2:]
+            human_ratio = mask.sum().item() / (h * w) # 人体占比
+            # 全身平均
+            # raw_mean = flow_subject.norm(dim=1, keepdim=True).mean().item() # 
+            # top20%平均
+            raw_mean = torch.topk(flow_subject.norm(dim=1).flatten(), max(1, int(0.2 * flow_subject.numel() / 2))).values.mean().item()
+            val = raw_mean / (max(human_ratio, 1e-6)**1.7) # 远小近大光流强度补偿
+            vals.append(val)
+            val_bg = flow_bg.norm(dim=1, keepdim=True).mean().item()
+            vals_bg.append(val_bg)
+            # print(f"[{(imfile1.split('/')[-1])} → {(imfile2.split('/')[-1])}] "
+            #       f"当前帧人体区域平均光流强度: {val:.3f}")
+        print("optiflow_human:", sum(vals)/len(vals))
+        print("optiflow_bg:", sum(vals_bg)/len(vals_bg))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', help="restore checkpoint")
-    parser.add_argument('--path', help="dataset for evaluation")
-    parser.add_argument('--small', action='store_true', help='use small model')
-    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+    parser.add_argument('--model', help="restore checkpoint", default="/home5/bwd/motion/filter/RAFT/models/raft-small.pth")
+    parser.add_argument('--path', help="dataset for evaluation", default="/home5/bwd/motion/filter/RAFT/demo-frames")
+    parser.add_argument('--small', action='store_true', help='use small model', default=True)
+    parser.add_argument('--local', action='store_true', help='use small model', default=True)
+    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision', default=False)
     parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
     args = parser.parse_args()
 
