@@ -24,7 +24,7 @@ or downloaded from [google drive](https://drive.google.com/drive/folders/1sWDsfu
 
 You can demo a trained model on a sequence of frames
 ```Shell
-python demo.py --model=models/raft-things.pth --path=demo-frames
+python demo.py --model=models/raft-things.pth
 ```
 
 ## Required Data

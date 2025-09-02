@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import time
 from PIL import Image
+from pathlib import Path
 
 from raft import RAFT
 from utils import flow_viz
@@ -16,10 +17,9 @@ from utils.utils import InputPadder
 import torchvision.transforms as T
 import torchvision.models as models
 
-
-DEVICE = 'cuda'
+# DEVICE = 'cuda'
 # DEVICE = 'cpu'
-# DEVICE = 'mps'
+DEVICE = 'mps'
 
 # 统一resize到小尺寸，减少计算开销
 def load_image(imfile):
@@ -119,7 +119,23 @@ def get_human_mask(image_torch, threshold=0.5):
 
     return mask
 
-def viz(img, flo):
+save_counter = 0 
+
+def images_to_gif(image_dir, output_path, duration=500):
+    files = sorted(
+        [f for f in os.listdir(image_dir) if f.endswith((".png", ".jpg", ".jpeg"))],
+        key=lambda x: int(os.path.splitext(x)[0])
+    )
+    images = [Image.open(os.path.join(image_dir, f)) for f in files]
+    images[0].save(
+        output_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration,
+        loop=0
+    )
+
+def viz(img, flo, args):
     img = img[0].permute(1,2,0).cpu().numpy()
     flo = flo[0].permute(1,2,0).cpu().numpy()
     
@@ -131,10 +147,44 @@ def viz(img, flo):
     # plt.imshow(img_flo / 255.0)
     # plt.show()
 
-    cv2.imshow('image', img_flo[:, :, [2,1,0]]/255.0)
-    cv2.waitKey()
+    global save_counter
+    os.makedirs("optiflow_res", exist_ok=True)
+    cv2.imwrite(f"optiflow_res/{save_counter}.png", img_flo[:, :, [2,1,0]].astype(np.uint8))
+    save_counter += 1
+    if args.remove_bg:
+        images_to_gif("optiflow_res", "remove_bg.gif")
+    else:
+        images_to_gif("optiflow_res", "normal.gif")
+
+    # cv2.imshow('image', img_flo[:, :, [2,1,0]]/255.0)
+    # cv2.waitKey()
+
+def extract_frames(VIDEO_PATH, OUTDIR, FRAME_INTERVAL) -> None:
+    video_path = Path(VIDEO_PATH)
+    outdir = Path(OUTDIR)
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+    outdir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频文件: {video_path}")
+    frame_id = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_id % FRAME_INTERVAL == 0:
+            save_name = outdir / f"{frame_id:08d}.jpg"
+            cv2.imwrite(str(save_name), frame)
+        frame_id += 1
+
+    cap.release()
 
 def demo(args):
+    frames_dir = args.path.split(".")[0]
+    extract_frames(args.path, frames_dir, 10)
+    args.path = frames_dir
+
     model = torch.nn.DataParallel(RAFT(args))
     # model.load_state_dict(torch.load(args.model))
     model.load_state_dict(torch.load(args.model, map_location=torch.device(DEVICE)))
@@ -157,18 +207,18 @@ def demo(args):
             padder = InputPadder(image1.shape)
             image1, image2 = padder.pad(image1, image2)
             flow_low, flow_up = model(image1, image2, iters=20, test_mode=True)
-            flow_bg = get_camera_motion(image1, image2)      
-            viz(image1, flow_subject) # 原始的光流可视化
-            flow_subject = flow_up-flow_bg
-            # viz(image1, flow_subject) # 减掉背景后的光流可视化
+            flow_bg = get_camera_motion(image1, image2)    
+            if args.remove_bg:
+                flow_up = flow_up-flow_bg # 减掉背景光流
+            viz(image1, flow_up, args) # 光流可视化
             mask = get_human_mask(image1)
-            flow_subject = flow_subject * mask
-            h, w = flow_subject.shape[-2:]
+            flow_up = flow_up * mask
+            h, w = flow_up.shape[-2:]
             human_ratio = mask.sum().item() / (h * w) # 人体占比
             # 全身平均
-            # raw_mean = flow_subject.norm(dim=1, keepdim=True).mean().item() # 
+            # raw_mean = flow_up.norm(dim=1, keepdim=True).mean().item() # 
             # top20%平均
-            raw_mean = torch.topk(flow_subject.norm(dim=1).flatten(), max(1, int(0.2 * flow_subject.numel() / 2))).values.mean().item()
+            raw_mean = torch.topk(flow_up.norm(dim=1).flatten(), max(1, int(0.2 * flow_up.numel() / 2))).values.mean().item()
             val = raw_mean / (max(human_ratio, 1e-6)**1.7) # 远小近大光流强度补偿
             vals.append(val)
             val_bg = flow_bg.norm(dim=1, keepdim=True).mean().item()
@@ -180,10 +230,10 @@ def demo(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', help="restore checkpoint", default="/home5/bwd/motion/filter/RAFT/models/raft-small.pth")
-    parser.add_argument('--path', help="dataset for evaluation", default="/home5/bwd/motion/filter/RAFT/demo-frames")
-    parser.add_argument('--small', action='store_true', help='use small model', default=True)
-    parser.add_argument('--local', action='store_true', help='use small model', default=True)
+    parser.add_argument('--remove_bg', action='store_true', default=False) # 是否移除背景光流
+    parser.add_argument('--model', help="restore checkpoint", default="models/raft-things.pth")
+    parser.add_argument('--path', help="dataset for evaluation", default="demo_video.mp4")
+    parser.add_argument('--small', action='store_true', help='use small model', default=False)
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision', default=False)
     parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
     args = parser.parse_args()
