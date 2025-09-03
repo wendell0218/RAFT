@@ -1,6 +1,6 @@
 # RAFT
 
-<img src="./merged.gif" width="400">
+<img src="./merged.gif">
 
 This repository contains the source code for our paper:
 

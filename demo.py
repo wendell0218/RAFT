@@ -180,6 +180,64 @@ def extract_frames(VIDEO_PATH, OUTDIR, FRAME_INTERVAL) -> None:
 
     cap.release()
 
+def process_video_for_flow(video_path,
+                           output_video_path,
+                           model,
+                           device,
+                           frame_interval=1,
+                           remove_bg=False):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if raw_w >= raw_h:
+        vw, vh = 768, 432
+    else:
+        vw, vh = 432, 768
+    out_w, out_h = vw * 2, vh
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (out_w, out_h))
+    prev_image_tensor = None
+    tmp_idx = 0
+    with torch.no_grad():
+        frame_id = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_id % frame_interval != 0:
+                frame_id += 1
+                continue
+            tmp_path = f"__tmp_{tmp_idx}.jpg"
+            cv2.imwrite(tmp_path, frame)      
+            current_image_tensor = load_image(tmp_path).to(device)
+            os.remove(tmp_path)
+            tmp_idx += 1
+            if prev_image_tensor is not None:
+                padder = InputPadder(prev_image_tensor.shape)
+                p1, p2 = padder.pad(prev_image_tensor, current_image_tensor)
+                _, flow_up = model(p1, p2, iters=20, test_mode=True)
+                flow_bg = get_camera_motion(prev_image_tensor, current_image_tensor)
+
+                if remove_bg:
+                    flow_up = flow_up - flow_bg
+
+                mask = get_human_mask(p1)
+                flow_up = flow_up * mask + (flow_bg) * (1-mask)
+
+                prev_rgb = _torch_img_to_cv_uint8_rgb(prev_image_tensor)
+                prev_bgr = cv2.cvtColor(prev_rgb, cv2.COLOR_RGB2BGR)
+                flow_up_np = flow_up[0].permute(1, 2, 0).cpu().numpy()
+                flow_rgb = flow_viz.flow_to_image(flow_up_np)
+                flow_bgr = cv2.cvtColor(flow_rgb, cv2.COLOR_RGB2BGR)
+                concat = np.concatenate([prev_bgr, flow_bgr], axis=1)
+                out.write(concat)
+            prev_image_tensor = current_image_tensor
+            frame_id += 1
+
+    cap.release()
+    out.release()
+
 def demo(args):
     frames_dir = args.path.split(".")[0]
     extract_frames(args.path, frames_dir, 10)
@@ -231,7 +289,7 @@ def demo(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--remove_bg', action='store_true', default=False) # 是否移除背景光流
-    parser.add_argument('--model', help="restore checkpoint", default="models/raft-things.pth")
+    parser.add_argument('--model', help="restore checkpoint", default="/Users/wendell/Desktop/motion/filter/RAFT/models/raft-things.pth")
     parser.add_argument('--path', help="dataset for evaluation", default="demo_video.mp4")
     parser.add_argument('--small', action='store_true', help='use small model', default=False)
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision', default=False)
@@ -239,3 +297,17 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     demo(args)
+
+    # model = torch.nn.DataParallel(RAFT(args))
+    # model.load_state_dict(torch.load(args.model, map_location=torch.device(DEVICE)))
+    # model = model.module
+    # model.to(DEVICE)
+    # model.eval()
+    # version = "static"
+    # for idx, video in enumerate(os.listdir(version)):
+    #     video_path = os.path.join(version, video)
+    #     process_video_for_flow(video_path, f'{version}_{str(idx).zfill(3)}.mp4', model, DEVICE, remove_bg=args.remove_bg)
+    # version = "dynamic"
+    # for idx, video in enumerate(os.listdir(version)):
+    #     video_path = os.path.join(version, video)
+    #     process_video_for_flow(video_path, f'{version}_{str(idx).zfill(3)}.mp4', model, DEVICE, remove_bg=args.remove_bg)
