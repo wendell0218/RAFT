@@ -289,7 +289,7 @@ def demo(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--remove_bg', action='store_true', default=False) # 是否移除背景光流
-    parser.add_argument('--model', help="restore checkpoint", default="/Users/wendell/Desktop/motion/filter/RAFT/models/raft-things.pth")
+    parser.add_argument('--model', help="restore checkpoint", default="models/raft-things.pth")
     parser.add_argument('--path', help="dataset for evaluation", default="demo_video.mp4")
     parser.add_argument('--small', action='store_true', help='use small model', default=False)
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision', default=False)
